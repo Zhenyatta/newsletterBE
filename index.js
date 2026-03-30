@@ -1,8 +1,9 @@
 import express from "express";
 import cors from "cors";
 import fs from "fs";
-import crypto from "crypto";
+import { createHash } from "crypto";
 import process from "process";
+import https from "https";
 import "dotenv/config";
 
 const app = express();
@@ -11,13 +12,25 @@ app.use(express.json());
 
 const API_KEY = process.env.MAILCHIMP_API_KEY;
 const LIST_ID = process.env.LIST_ID;
+const PORT = process.env.PORT || 3001;
+
+if (!API_KEY || !LIST_ID) {
+  throw new Error("Missing required environment variables");
+}
+
 const DC = API_KEY.split("-")[1];
 
-console.log(API_KEY, LIST_ID);
+const agent = new https.Agent({ keepAlive: true });
 
 const campaignImageMap = JSON.parse(
   fs.readFileSync(new URL("./campaignImageMap.json", import.meta.url)),
 );
+
+const getAuthHeader = () =>
+  `Basic ${Buffer.from(`anystring:${API_KEY}`).toString("base64")}`;
+
+const isValidEmail = (email) =>
+  typeof email === "string" && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
 
 app.get("/api/campaigns", async (req, res) => {
   try {
@@ -25,41 +38,44 @@ app.get("/api/campaigns", async (req, res) => {
       `https://${DC}.api.mailchimp.com/3.0/campaigns`,
       {
         headers: {
-          Authorization: `Basic ${Buffer.from(`anystring:${API_KEY}`).toString("base64")}`,
+          Authorization: getAuthHeader(),
         },
+        agent,
       },
     );
 
     if (!response.ok) {
-      return res.status(500).json({ error: "Mailchimp fetch failed" });
+      return res.status(502).json({
+        error: "Failed to fetch campaigns from Mailchimp",
+      });
     }
 
     const data = await response.json();
 
-    res.json(
-      data.campaigns.map((c) => ({
-        id: c.id,
-        title: c.settings.title,
-        subject: c.settings.subject_line,
-        date: c.send_time,
-        long_archive_url: c.long_archive_url,
-        image: campaignImageMap[c.id] ?? null,
-      })),
-    );
+    const campaigns = data.campaigns.map((c) => ({
+      id: c.id,
+      title: c.settings.title,
+      subject: c.settings.subject_line,
+      date: c.send_time,
+      long_archive_url: c.long_archive_url,
+      image: campaignImageMap[c.id] ?? null,
+    }));
+
+    res.json(campaigns);
   } catch (e) {
-    res.status(500).json({ error: "Server error" });
+    console.error("Campaign fetch error:", e);
+    res.status(500).json({ error: "Internal server error" });
   }
 });
 
 app.post("/api/subscribe", async (req, res) => {
   const { email } = req.body;
 
-  if (!email) {
-    return res.status(400).json({ error: "Email is required" });
+  if (!isValidEmail(email)) {
+    return res.status(400).json({ error: "Invalid email" });
   }
 
-  const subscriberHash = crypto
-    .createHash("md5")
+  const subscriberHash = createHash("md5")
     .update(email.toLowerCase())
     .digest("hex");
 
@@ -69,28 +85,33 @@ app.post("/api/subscribe", async (req, res) => {
       {
         method: "PUT",
         headers: {
-          Authorization: `Basic ${Buffer.from(`anystring:${API_KEY}`).toString("base64")}`,
+          Authorization: getAuthHeader(),
           "Content-Type": "application/json",
         },
         body: JSON.stringify({
           email_address: email,
           status_if_new: "subscribed",
         }),
+        agent,
       },
     );
 
     const data = await response.json();
 
     if (!response.ok) {
-      return res.status(400).json(data);
+      return res.status(400).json({
+        error: "Subscription failed",
+        details: data?.detail || null,
+      });
     }
 
     return res.json({ success: true });
   } catch (e) {
-    return res.status(500).json({ error: "Server error" });
+    console.error("Subscribe error:", e);
+    return res.status(500).json({ error: "Internal server error" });
   }
 });
 
-app.listen(3001, () => {
-  console.log("API running on http://localhost:3001");
+app.listen(PORT, () => {
+  console.log(`API running on port ${PORT}`);
 });
